@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"slices"
 	"syscall"
 
 	"github.com/alecthomas/kong"
@@ -86,14 +87,14 @@ var CLI struct {
 	Impact             ImpactCmd             `cmd:"" name:"impact" help:"Transitive reverse-dependency closure for a function — every function that (in)directly calls it, the blast radius of changing it. Extends who-calls (one hop) to the full closure with depth. e.g. impact BuildCodeGraph."`
 	CallPath           CallPathCmd           `cmd:"" name:"call-path" help:"Show the shortest call path from one function to another — HOW A reaches B through the call graph (the route, where impact gives the closure). e.g. call-path Run BuildCodeGraph."`
 	Trace              TraceCmd              `cmd:"" name:"trace" help:"Both directions of a symbol's call graph in one view — its callers (who-calls) and callees (calls), optionally plus the transitive caller closure (--impact-depth). e.g. trace ServeHTTP."`
-	References          ReferencesCmd         `cmd:"" name:"references" help:"Find every usage of a symbol with file + line — calls, type usages, and Go value-passing — the IDE 'find references' primitive (complement to find-definition). e.g. references BuildCodeGraph --kind type."`
+	References         ReferencesCmd         `cmd:"" name:"references" help:"Find every usage of a symbol with file + line — calls, type usages, and Go value-passing — the IDE 'find references' primitive (complement to find-definition). e.g. references BuildCodeGraph --kind type."`
 	Complexity         ComplexityCmd         `cmd:"" name:"complexity" help:"List functions ranked by cyclomatic complexity (worst-first) — find maintenance hotspots. Go + tree-sitter languages. e.g. complexity 'is_source && language==\"go\"' --top 20."`
 	Diff               DiffCmd               `cmd:"" name:"diff" help:"Cross-tree set operations by sha256 content hash — what's in tree A but not B, the intersection, drift between same-named files, etc. Read-only discovery; never mutates either tree. e.g. diff ~/Pictures /Volumes/Backup/Pictures --op a-minus-b."`
 	APIDiff            APIDiffCmd            `cmd:"" name:"api-diff" help:"Detect breaking changes to the exported public API surface between two trees — removed exported functions/types (breaking) vs added. A release gate. e.g. api-diff ./v1 ./v2 --expr 'is_source && language==\"go\"'."`
 	ChurnOwners        ChurnOwnersCmd        `cmd:"" name:"churn-owners" help:"Ownership / bus-factor per directory — which subtrees are effectively single-maintainer, ranked by risk. Aggregates git authorship over tracked files. e.g. churn-owners --expr is_source -d ."`
-	Coupling           CouplingCmd           `cmd:"" name:"coupling" help:"Afferent/efferent coupling + instability (Martin metrics) — the fragile-hub seams (high Ca + high I) a refactor is riskiest near. Granularity is picked by the manifest at the root: Go (go.mod) → packages, Rust (Cargo.toml) → crates, JVM — Java / Kotlin / Scala (Maven / Gradle / sbt) → packages, C# (.sln / .csproj) → namespaces, Python (pyproject.toml / setup.py) → packages, JS/TS (package.json / tsconfig.json) → directory modules, PHP (composer.json) → namespaces, Perl (cpanfile / Makefile.PL) → packages, Ruby (Gemfile / *.gemspec) → directory modules, C/C++ (CMakeLists.txt / configure.ac / meson.build) → directory modules (#include graph). More languages tracked in #467. e.g. coupling -d . --top 20."`
+	Coupling           CouplingCmd           `cmd:"" name:"coupling" help:"Afferent/efferent coupling + instability (Martin metrics) — the fragile-hub seams (high Ca + high I) a refactor is riskiest near. Granularity is picked by the manifest at the root: Go (go.mod) → packages, Rust (Cargo.toml) → crates, Swift (Package.swift) → SwiftPM target modules, JVM — Java / Kotlin / Scala (Maven / Gradle / sbt) → packages, C# (.sln / .csproj) → namespaces, Python (pyproject.toml / setup.py) → packages, JS/TS (package.json / tsconfig.json) → directory modules, PHP (composer.json) → namespaces, Perl (cpanfile / Makefile.PL) → packages, Ruby (Gemfile / *.gemspec) → directory modules, C/C++ (CMakeLists.txt / configure.ac / meson.build) → directory modules (#include graph). More languages tracked in #467. e.g. coupling -d . --top 20."`
 	UnusedExports      UnusedExportsCmd      `cmd:"" name:"unused-exports" help:"Exported symbols referenced only within their own package — candidates to unexport and shrink the public API surface. The subtler complement to dead-code. Go / Python / Rust / TS / JS / Java / C# / Kotlin / Scala. e.g. unused-exports -d ."`
-	Circular           CircularCmd           `cmd:"" name:"circular" help:"Detect circular dependencies — strongly-connected components in the first-party import graph (Tarjan SCC). Same manifest-based language selection as coupling, so it's multi-language (Go / Rust / JVM / C# / Python / JS-TS / PHP / Perl / Ruby / C / C++). e.g. circular -d ."`
+	Circular           CircularCmd           `cmd:"" name:"circular" help:"Detect circular dependencies — strongly-connected components in the first-party import graph (Tarjan SCC). Same manifest-based language selection as coupling, so it's multi-language (Go / Rust / Swift / JVM / C# / Python / JS-TS / PHP / Perl / Ruby / C / C++). e.g. circular -d ."`
 	Review             ReviewCmd             `cmd:"" name:"review" help:"Diff-scoped review gate: resolve the files changed in the git diff, run the per-file analyses (complexity, dead-code) scoped to them, and emit findings + a pass/warn/fail verdict. Exit code gates CI / pre-commit. e.g. review --base origin/main."`
 	Validate           ValidateCmd           `cmd:"" name:"validate" help:"Compile-check a CEL expression without walking the filesystem — fast pre-flight or CI gate. Reports referenced variables/functions and a 'did you mean' hint on typos. Exits non-zero when invalid. e.g. validate 'is_pdf && page_count > 10'."`
 	IndexStats         IndexStatsCmd         `cmd:"" name:"index-stats" help:"Inspect the on-disk attribute/body/embedding cache without running a search — entry counts, bytes used, and cache hit/miss counters. Counterpart to the search footer and the MCP index_stats tool."`
@@ -142,8 +143,8 @@ func startProfiling() (stop func(), err error) {
 	var stops []func()
 	cleanup := func() {
 		// LIFO so each writer is stopped before its file is closed.
-		for i := len(stops) - 1; i >= 0; i-- {
-			stops[i]()
+		for _, stop := range slices.Backward(stops) {
+			stop()
 		}
 	}
 
@@ -251,8 +252,7 @@ func main() {
 	stopProfiling()
 
 	if runErr != nil {
-		var ece *exitCodeError
-		if errors.As(runErr, &ece) {
+		if ece, ok := errors.AsType[*exitCodeError](runErr); ok {
 			// The subcommand has already printed its own diagnostic
 			// to stderr; surface only the exit code.
 			os.Exit(ece.code)
